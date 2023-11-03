@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	noStreamName = "THIS IS INVALID STREAM"
+	noStreamName             = "THIS IS INVALID STREAM"
+	maxLogGroupsPerDiscovery = int64(50)
 )
 
 type logsReceiver struct {
@@ -41,25 +42,32 @@ type logsReceiver struct {
 	doneChan            chan bool
 }
 
-const maxLogGroupsPerDiscovery = int64(50)
-
 type client interface {
 	DescribeLogGroupsWithContext(ctx context.Context, input *cloudwatchlogs.DescribeLogGroupsInput, opts ...request.Option) (*cloudwatchlogs.DescribeLogGroupsOutput, error)
 	FilterLogEventsWithContext(ctx context.Context, input *cloudwatchlogs.FilterLogEventsInput, opts ...request.Option) (*cloudwatchlogs.FilterLogEventsOutput, error)
 }
 
 type streamNames struct {
-	group string
-	names []*string
+	group       string
+	arn         string
+	names       []*string
+	storedBytes int64
 }
 
 func (sn *streamNames) request(limit int, nextToken string, st, et *time.Time) *cloudwatchlogs.FilterLogEventsInput {
+
 	base := &cloudwatchlogs.FilterLogEventsInput{
-		LogGroupName: &sn.group,
-		StartTime:    aws.Int64(st.UnixMilli()),
-		EndTime:      aws.Int64(et.UnixMilli()),
-		Limit:        aws.Int64(int64(limit)),
+		StartTime: aws.Int64(st.UnixMilli()),
+		EndTime:   aws.Int64(et.UnixMilli()),
+		Limit:     aws.Int64(int64(limit)),
 	}
+
+	if sn.arn != "" {
+		base.LogGroupIdentifier = aws.String(sn.arn)
+	} else {
+		base.LogGroupName = &sn.group
+	}
+
 	if len(sn.names) > 0 {
 		base.LogStreamNames = sn.names
 	}
@@ -74,18 +82,26 @@ func (sn *streamNames) groupName() string {
 }
 
 type streamPrefix struct {
-	group  string
-	prefix *string
+	group       string
+	arn         string
+	prefix      *string
+	storedBytes int64
 }
 
 func (sp *streamPrefix) request(limit int, nextToken string, st, et *time.Time) *cloudwatchlogs.FilterLogEventsInput {
 	base := &cloudwatchlogs.FilterLogEventsInput{
-		LogGroupName:        &sp.group,
 		StartTime:           aws.Int64(st.UnixMilli()),
 		EndTime:             aws.Int64(et.UnixMilli()),
 		Limit:               aws.Int64(int64(limit)),
 		LogStreamNamePrefix: sp.prefix,
 	}
+
+	if sp.arn != "" {
+		base.LogGroupIdentifier = aws.String(sp.arn)
+	} else {
+		base.LogGroupName = &sp.group
+	}
+
 	if nextToken != "" {
 		base.NextToken = aws.String(nextToken)
 	}
@@ -102,20 +118,23 @@ type groupRequest interface {
 }
 
 func newLogsReceiver(cfg *Config, logger *zap.Logger, consumer consumer.Logs) *logsReceiver {
-	groups := []groupRequest{}
-	for logGroupName, sc := range cfg.Logs.Groups.NamedConfigs {
-		for _, prefix := range sc.Prefixes {
-			groups = append(groups, &streamPrefix{group: logGroupName, prefix: prefix})
+	var groups []groupRequest
+	autodiscover := &AutodiscoverConfig{}
+
+	if len(cfg.Logs.Groups.NamedConfigs) > 0 {
+		for logGroupName, sc := range cfg.Logs.Groups.NamedConfigs {
+			for _, prefix := range sc.Prefixes {
+				groups = append(groups, &streamPrefix{group: logGroupName, prefix: prefix})
+			}
+			if len(sc.Names) > 0 {
+				groups = append(groups, &streamNames{group: logGroupName, names: sc.Names})
+			}
 		}
-		if len(sc.Names) > 0 {
-			groups = append(groups, &streamNames{group: logGroupName, names: sc.Names})
-		}
+		autodiscover = nil
 	}
 
-	// safeguard from using both
-	autodiscover := cfg.Logs.Groups.AutodiscoverConfig
-	if len(cfg.Logs.Groups.NamedConfigs) > 0 {
-		autodiscover = nil
+	if cfg.Logs.Groups.AutodiscoverConfig != nil {
+		autodiscover = cfg.Logs.Groups.AutodiscoverConfig
 	}
 
 	return &logsReceiver{
@@ -227,7 +246,7 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string, output *cloudwatchlogs.FilterLogEventsOutput) plog.Logs {
 	logs := plog.NewLogs()
 
-	resourceMap := map[string](map[string]*plog.ResourceLogs){}
+	resourceMap := map[string]map[string]*plog.ResourceLogs{}
 
 	for _, e := range output.Events {
 		if e.Timestamp == nil {
@@ -266,11 +285,11 @@ func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string,
 			resourceAttributes.PutStr("cloudwatch.log.stream", logStreamName)
 			group[logStreamName] = resourceLogs
 
-			// Ensure one scopeLogs is initialized so we can handle in standardized way going forward.
+			// Ensure one scopeLogs is initialized, so we can handle in standardized way going forward.
 			_ = resourceLogs.ScopeLogs().AppendEmpty()
 		}
 
-		// Now we know resourceLogs is initialized and has one scopeLogs so we don't have to handle any special cases.
+		// Now we know resourceLogs is initialized and has one scopeLogs, so we don't have to handle any special cases.
 
 		logRecord := resourceLogs.ScopeLogs().At(0).LogRecords().AppendEmpty()
 
@@ -285,7 +304,7 @@ func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string,
 
 func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverConfig) ([]groupRequest, error) {
 	l.logger.Debug("attempting to discover log groups.", zap.Int("limit", auto.Limit))
-	groups := []groupRequest{}
+	var groups []groupRequest
 	err := l.ensureSession()
 	if err != nil {
 		return groups, fmt.Errorf("unable to establish a session to auto discover log groups: %w", err)
@@ -300,6 +319,14 @@ func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverCon
 
 		req := &cloudwatchlogs.DescribeLogGroupsInput{
 			Limit: aws.Int64(maxLogGroupsPerDiscovery),
+		}
+
+		if auto.IncludeLinkedAccounts {
+			req.IncludeLinkedAccounts = &auto.IncludeLinkedAccounts
+		}
+
+		if auto.IncludeLinkedAccounts && len(auto.AccountIdentifiers) >= 1 {
+			req.AccountIdentifiers = auto.AccountIdentifiers
 		}
 
 		if auto.Prefix != "" {
@@ -318,26 +345,35 @@ func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverCon
 					zap.Int("groups_discovered", numGroups), zap.Int("limit", auto.Limit))
 				break
 			}
+			if lg.StoredBytes != nil && *lg.StoredBytes > int64(0) {
+				numGroups++
+				l.logger.Debug("discovered log group", zap.String("log group", lg.GoString()))
+				// default behavior is to collect all if not stream filtered
+				if len(auto.Streams.Names) == 0 && len(auto.Streams.Prefixes) == 0 {
+					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), storedBytes: *lg.StoredBytes})
+					continue
+				}
 
-			numGroups++
-			l.logger.Debug("discovered log group", zap.String("log group", lg.GoString()))
-			// default behavior is to collect all if not stream filtered
-			if len(auto.Streams.Names) == 0 && len(auto.Streams.Prefixes) == 0 {
-				groups = append(groups, &streamNames{group: *lg.LogGroupName})
-				continue
-			}
+				for _, prefix := range auto.Streams.Prefixes {
+					groups = append(groups, &streamPrefix{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), prefix: prefix, storedBytes: *lg.StoredBytes})
+				}
 
-			for _, prefix := range auto.Streams.Prefixes {
-				groups = append(groups, &streamPrefix{group: *lg.LogGroupName, prefix: prefix})
-			}
-
-			if len(auto.Streams.Names) > 0 {
-				groups = append(groups, &streamNames{group: *lg.LogGroupName, names: auto.Streams.Names})
+				if len(auto.Streams.Names) > 0 {
+					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), names: auto.Streams.Names, storedBytes: *lg.StoredBytes})
+				}
 			}
 		}
 		nextToken = dlgResults.NextToken
 	}
 	return groups, nil
+}
+
+// transformARN removes the last two characters - which are "/*" - from the AR
+func transformARN(arn string) string {
+	if arn != "" {
+		return arn[:len(arn)-2]
+	}
+	return ""
 }
 
 func (l *logsReceiver) ensureSession() error {

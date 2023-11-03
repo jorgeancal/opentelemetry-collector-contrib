@@ -50,6 +50,8 @@ This receiver uses the [AWS SDK](https://docs.aws.amazon.com/sdk-for-go/v1/devel
   - `streams`: (optional) If `streams` is omitted, then all streams will be attempted to retrieve events from.
     - `names`: A list of full log stream names to filter the discovered log groups to collect from.
     - `prefixes`: A list of prefixes to filter the discovered log groups to collect from.
+  - `includeLinkedAccounts`: (optional) Include the linked accounts in the autodiscovery. This is mandatory if you add the `accountIdentifiers`.
+  - `accountIdentifiers`: (optional) List of AWS Account IDs.
 - `named`
   - This is a map of log group name to stream filtering options
     - `streams`: (optional)
@@ -69,6 +71,21 @@ awscloudwatch:
         prefix: /aws/eks/
         streams:
           prefixes: [kube-api-controller]
+```
+#### Autodiscovery Example Configuration using AWS Monitoring Account
+
+```yaml
+awscloudwatch:
+  region: us-west-1
+  logs:
+    poll_interval: 1m
+    groups:
+      autodiscover:
+        limit: 100
+        prefix: /aws/eks/
+        streams:
+          prefixes: [kube-api-controller]
+        includeLinkedAccounts: true
 ```
 
 #### Named Example

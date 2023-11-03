@@ -171,10 +171,13 @@ func TestShutdownWhileCollecting(t *testing.T) {
 func TestAutodiscoverLimit(t *testing.T) {
 	mc := &mockClient{}
 
+	storedBytes := int64(213)
 	logGroups := []*cloudwatchlogs.LogGroup{}
 	for i := 0; i <= 100; i++ {
 		logGroups = append(logGroups, &cloudwatchlogs.LogGroup{
 			LogGroupName: aws.String(fmt.Sprintf("test log group: %d", i)),
+			Arn:          &testLogArn,
+			StoredBytes:  aws.Int64(storedBytes),
 		})
 	}
 	token := "token"
@@ -212,11 +215,14 @@ func TestAutodiscoverLimit(t *testing.T) {
 
 func defaultMockClient() client {
 	mc := &mockClient{}
+	storedBytes := int64(1)
 	mc.On("DescribeLogGroupsWithContext", mock.Anything, mock.Anything, mock.Anything).Return(
 		&cloudwatchlogs.DescribeLogGroupsOutput{
 			LogGroups: []*cloudwatchlogs.LogGroup{
 				{
 					LogGroupName: &testLogGroupName,
+					Arn:          &testLogArn,
+					StoredBytes:  &storedBytes,
 				},
 			},
 			NextToken: nil,
@@ -260,6 +266,7 @@ func defaultMockClient() client {
 
 var (
 	testLogGroupName    = "test-log-group-name"
+	testLogArn          = "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole/*"
 	testLogStreamName   = "test-log-stream-name"
 	testLogStreamName2  = "test-log-stream-name-2"
 	testLogStreamPrefix = "test-log-stream"
