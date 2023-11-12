@@ -127,6 +127,78 @@ func TestValidate(t *testing.T) {
 			},
 			expectedErr: errAutodiscoverAndNamedConfigured,
 		},
+		{
+			name: "Valid Config",
+			config: Config{
+				Region: "eu-west-1",
+				Logs: &LogsConfig{
+					MaxEventsPerRequest: defaultEventLimit,
+					PollInterval:        defaultPollInterval,
+					Groups: GroupConfig{
+						AutodiscoverConfig: &AutodiscoverConfig{
+							Limit:                 defaultEventLimit,
+							IncludeLinkedAccounts: true,
+							AccountIdentifiers:    []*string{aws.String("022152963040")},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Invalid Config too many accounts Identifiers",
+			config: Config{
+				Region: "eu-west-1",
+				Logs: &LogsConfig{
+					MaxEventsPerRequest: defaultEventLimit,
+					PollInterval:        defaultPollInterval,
+					Groups: GroupConfig{
+						AutodiscoverConfig: &AutodiscoverConfig{
+							Limit:                 defaultEventLimit,
+							IncludeLinkedAccounts: true,
+							AccountIdentifiers: []*string{aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040")},
+						},
+					},
+				},
+			},
+			expectedErr: errInvalidAccountIdentifiers,
+		},
+		{
+			name: "Valid Config",
+			config: Config{
+				Region: "eu-west-1",
+				Logs: &LogsConfig{
+					MaxEventsPerRequest: defaultEventLimit,
+					PollInterval:        defaultPollInterval,
+					Groups: GroupConfig{
+						AutodiscoverConfig: &AutodiscoverConfig{
+							Limit:                 defaultEventLimit,
+							IncludeLinkedAccounts: true,
+							AccountIdentifiers: []*string{aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040"), aws.String("022152963040"),
+								aws.String("022152963040")},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range cases {
