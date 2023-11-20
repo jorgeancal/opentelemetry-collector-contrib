@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -53,6 +54,7 @@ func TestPrefixedConfig(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	alertRcvr := newLogsReceiver(cfg, zap.NewNop(), sink)
 	alertRcvr.client = defaultMockClient()
+	alertRcvr.stsClient = stsMockClient()
 
 	err := alertRcvr.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
@@ -85,6 +87,7 @@ func TestPrefixedNamedStreamsConfig(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	alertRcvr := newLogsReceiver(cfg, zap.NewNop(), sink)
 	alertRcvr.client = defaultMockClient()
+	alertRcvr.stsClient = stsMockClient()
 
 	err := alertRcvr.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
@@ -123,6 +126,7 @@ func TestDiscovery(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	logsRcvr := newLogsReceiver(cfg, zap.NewNop(), sink)
 	logsRcvr.client = defaultMockClient()
+	logsRcvr.stsClient = stsMockClient()
 
 	require.NoError(t, logsRcvr.Start(context.Background(), componenttest.NewNopHost()))
 	require.Eventually(t, func() bool {
@@ -156,6 +160,7 @@ func TestShutdownWhileCollecting(t *testing.T) {
 	}, nil).
 		WaitUntil(doneChan)
 	alertRcvr.client = mc
+	alertRcvr.stsClient = stsMockClient()
 
 	err := alertRcvr.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
@@ -172,7 +177,7 @@ func TestAutodiscoverLimit(t *testing.T) {
 	mc := &mockClient{}
 
 	storedBytes := int64(213)
-	logGroups := []*cloudwatchlogs.LogGroup{}
+	var logGroups []*cloudwatchlogs.LogGroup
 	for i := 0; i <= 100; i++ {
 		logGroups = append(logGroups, &cloudwatchlogs.LogGroup{
 			LogGroupName: aws.String(fmt.Sprintf("test log group: %d", i)),
@@ -207,6 +212,7 @@ func TestAutodiscoverLimit(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	alertRcvr := newLogsReceiver(cfg, zap.NewNop(), sink)
 	alertRcvr.client = mc
+	alertRcvr.stsClient = stsMockClient()
 
 	grs, err := alertRcvr.discoverGroups(context.Background(), cfg.Logs.Groups.AutodiscoverConfig)
 	require.NoError(t, err)
@@ -264,9 +270,19 @@ func defaultMockClient() client {
 	return mc
 }
 
+func stsMockClient() stsClient {
+	msc := &mockstsClient{}
+	msc.On("GetCallerIdentity", mock.Anything).Return(
+		&sts.GetCallerIdentityOutput{
+			Account: aws.String(testAccountID),
+		}, nil)
+	return msc
+}
+
 var (
 	testLogGroupName    = "test-log-group-name"
 	testLogArn          = "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole/*"
+	testAccountID       = "123456789"
 	testLogStreamName   = "test-log-stream-name"
 	testLogStreamName2  = "test-log-stream-name-2"
 	testLogStreamPrefix = "test-log-stream"
@@ -283,6 +299,15 @@ var (
 
 type mockClient struct {
 	mock.Mock
+}
+
+type mockstsClient struct {
+	mock.Mock
+}
+
+func (msc *mockstsClient) GetCallerIdentity(input *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error) {
+	args := msc.Called(input)
+	return args.Get(0).(*sts.GetCallerIdentityOutput), args.Error(1)
 }
 
 func (mc *mockClient) DescribeLogGroupsWithContext(ctx context.Context, input *cloudwatchlogs.DescribeLogGroupsInput, opts ...request.Option) (*cloudwatchlogs.DescribeLogGroupsOutput, error) {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -37,6 +39,8 @@ type logsReceiver struct {
 	autodiscover        *AutodiscoverConfig
 	logger              *zap.Logger
 	client              client
+	stsClient           stsClient
+	accountID           string
 	consumer            consumer.Logs
 	wg                  *sync.WaitGroup
 	doneChan            chan bool
@@ -47,9 +51,14 @@ type client interface {
 	FilterLogEventsWithContext(ctx context.Context, input *cloudwatchlogs.FilterLogEventsInput, opts ...request.Option) (*cloudwatchlogs.FilterLogEventsOutput, error)
 }
 
+type stsClient interface {
+	GetCallerIdentity(input *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error)
+}
+
 type streamNames struct {
 	group       string
 	arn         string
+	account     string
 	names       []*string
 	storedBytes int64
 }
@@ -81,9 +90,14 @@ func (sn *streamNames) groupName() string {
 	return sn.group
 }
 
+func (sn *streamNames) accountID() string {
+	return sn.account
+}
+
 type streamPrefix struct {
 	group       string
 	arn         string
+	account     string
 	prefix      *string
 	storedBytes int64
 }
@@ -112,9 +126,14 @@ func (sp *streamPrefix) groupName() string {
 	return sp.group
 }
 
+func (sp *streamPrefix) accountID() string {
+	return sp.account
+}
+
 type groupRequest interface {
 	request(limit int, nextToken string, st, et *time.Time) *cloudwatchlogs.FilterLogEventsInput
 	groupName() string
+	accountID() string
 }
 
 func newLogsReceiver(cfg *Config, logger *zap.Logger, consumer consumer.Logs) *logsReceiver {
@@ -124,10 +143,10 @@ func newLogsReceiver(cfg *Config, logger *zap.Logger, consumer consumer.Logs) *l
 	if len(cfg.Logs.Groups.NamedConfigs) > 0 {
 		for logGroupName, sc := range cfg.Logs.Groups.NamedConfigs {
 			for _, prefix := range sc.Prefixes {
-				groups = append(groups, &streamPrefix{group: logGroupName, prefix: prefix})
+				groups = append(groups, &streamPrefix{group: logGroupName, account: "", prefix: prefix})
 			}
 			if len(sc.Names) > 0 {
-				groups = append(groups, &streamNames{group: logGroupName, names: sc.Names})
+				groups = append(groups, &streamNames{group: logGroupName, account: "", names: sc.Names})
 			}
 		}
 		autodiscover = nil
@@ -215,6 +234,14 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 	}
 	nextToken := aws.String("")
 
+	if l.accountID == "" {
+		result, errSts := l.stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+		if errSts != nil {
+			l.logger.Warn("Unable to get Account identity to provide AccountId as a Resource")
+		}
+		l.accountID = *result.Account
+	}
+
 	for nextToken != nil {
 		select {
 		// if done, we want to stop processing paginated stream of events
@@ -230,7 +257,7 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 				break
 			}
 			observedTime := pcommon.NewTimestampFromTime(time.Now())
-			logs := l.processEvents(observedTime, pc.groupName(), resp)
+			logs := l.processEvents(observedTime, pc.groupName(), pc.accountID(), resp)
 			if logs.LogRecordCount() > 0 {
 				if err = l.consumer.ConsumeLogs(ctx, logs); err != nil {
 					l.logger.Error("unable to consume logs", zap.Error(err))
@@ -243,7 +270,7 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 	return nil
 }
 
-func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string, output *cloudwatchlogs.FilterLogEventsOutput) plog.Logs {
+func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string, accountID string, output *cloudwatchlogs.FilterLogEventsOutput) plog.Logs {
 	logs := plog.NewLogs()
 
 	resourceMap := map[string]map[string]*plog.ResourceLogs{}
@@ -275,12 +302,17 @@ func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string,
 			logStreamName = *e.LogStreamName
 		}
 
+		if accountID == "" {
+			accountID = l.accountID
+		}
+
 		resourceLogs, ok := group[logStreamName]
 		if !ok {
 			rl := logs.ResourceLogs().AppendEmpty()
 			resourceLogs = &rl
 			resourceAttributes := resourceLogs.Resource().Attributes()
 			resourceAttributes.PutStr("aws.region", l.region)
+			resourceAttributes.PutStr("aws.accountID", accountID)
 			resourceAttributes.PutStr("cloudwatch.log.group.name", logGroupName)
 			resourceAttributes.PutStr("cloudwatch.log.stream", logStreamName)
 			group[logStreamName] = resourceLogs
@@ -350,22 +382,30 @@ func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverCon
 				l.logger.Debug("discovered log group", zap.String("log group", lg.GoString()))
 				// default behavior is to collect all if not stream filtered
 				if len(auto.Streams.Names) == 0 && len(auto.Streams.Prefixes) == 0 {
-					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), storedBytes: *lg.StoredBytes})
+					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), account: getAccountIDFromArn(*lg.Arn), storedBytes: *lg.StoredBytes})
 					continue
 				}
 
 				for _, prefix := range auto.Streams.Prefixes {
-					groups = append(groups, &streamPrefix{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), prefix: prefix, storedBytes: *lg.StoredBytes})
+					groups = append(groups, &streamPrefix{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), account: getAccountIDFromArn(*lg.Arn), prefix: prefix, storedBytes: *lg.StoredBytes})
 				}
 
 				if len(auto.Streams.Names) > 0 {
-					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), names: auto.Streams.Names, storedBytes: *lg.StoredBytes})
+					groups = append(groups, &streamNames{group: *lg.LogGroupName, arn: transformARN(*lg.Arn), account: getAccountIDFromArn(*lg.Arn), names: auto.Streams.Names, storedBytes: *lg.StoredBytes})
 				}
 			}
 		}
 		nextToken = dlgResults.NextToken
 	}
 	return groups, nil
+}
+
+func getAccountIDFromArn(arn string) string {
+	arnSplit := strings.Split(arn, ":")
+	if len(arnSplit) < 5 {
+		return ""
+	}
+	return arnSplit[4]
 }
 
 // transformARN removes the last two characters - which are "/*" - from the AR
@@ -392,5 +432,6 @@ func (l *logsReceiver) ensureSession() error {
 	}
 	s, err := session.NewSessionWithOptions(options)
 	l.client = cloudwatchlogs.New(s)
+	l.stsClient = sts.New(s)
 	return err
 }

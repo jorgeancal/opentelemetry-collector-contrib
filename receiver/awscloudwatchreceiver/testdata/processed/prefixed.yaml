@@ -4,6 +4,9 @@ resourceLogs:
         - key: aws.region
           value:
             stringValue: us-west-1
+        - key: aws.accountID
+          value:
+            stringValue: "123456789"
         - key: cloudwatch.log.group.name
           value:
             stringValue: test-log-group-name
@@ -38,6 +41,9 @@ resourceLogs:
         - key: aws.region
           value:
             stringValue: us-west-1
+        - key: aws.accountID
+          value:
+            stringValue: "123456789"
         - key: cloudwatch.log.group.name
           value:
             stringValue: test-log-group-name
