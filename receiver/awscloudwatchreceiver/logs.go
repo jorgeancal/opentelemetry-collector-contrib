@@ -365,6 +365,7 @@ func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverCon
 			req.LogGroupNamePrefix = &auto.Prefix
 		}
 
+		l.logger.Debug("print payload", zap.String("payload", req.String()))
 		dlgResults, err := l.client.DescribeLogGroupsWithContext(ctx, req)
 		if err != nil {
 			return groups, fmt.Errorf("unable to list log groups: %w", err)
